@@ -1,0 +1,33 @@
+#!/bin/bash
+#SBATCH --job-name=sae_prep
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=02:00:00
+#SBATCH --array=0-1
+#SBATCH --output=logs/%x_%A_%a.out
+
+# caches the embeddings once per model so the lambda runs in train.job can all run
+# in parallel without recomputing the same thing. task 0 = efficientnet, 1 = mobilenet.
+# the sample counts here must match train.job (they are part of the cache filename).
+set -e
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate ieia
+
+export HF_TOKEN=$(cat ~/.hf_token)
+export HF_HOME=/scratch-shared/$USER/hf
+mkdir -p $HF_HOME
+
+cd $HOME/miniproject
+
+models=(efficientnet mobilenet)
+model=${models[$SLURM_ARRAY_TASK_ID]}
+
+python train.py --prepare-only \
+    --model $model \
+    --train-samples 100000 \
+    --val-samples 10000

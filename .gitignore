@@ -46,11 +46,7 @@ env/
 .github/copilot/
 
 # Notes
-idea.md
-
-# Job files for Snellius
-*.job
-*.sh
+idea*.md
 
 # Pdfs
 *.pdf

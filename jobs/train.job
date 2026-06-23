@@ -1,0 +1,43 @@
+#!/bin/bash
+#SBATCH --job-name=sae_train
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=04:00:00
+#SBATCH --array=0-5
+#SBATCH --output=logs/%x_%A_%a.out
+
+# the real training, one array task per (model, l1) so all 6 run in parallel.
+# needs the embeddings from prepare.job, so submit them in order (see submit_all.sh).
+set -e
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate ieia
+
+export HF_TOKEN=$(cat ~/.hf_token)
+export HF_HOME=/scratch-shared/$USER/hf
+mkdir -p $HF_HOME
+
+cd $HOME/miniproject
+
+# 6 configs: 2 models x 3 l1 values
+models=(efficientnet efficientnet efficientnet mobilenet mobilenet mobilenet)
+l1s=(4e-4 8e-4 1.6e-3 4e-4 8e-4 1.6e-3)
+model=${models[$SLURM_ARRAY_TASK_ID]}
+l1=${l1s[$SLURM_ARRAY_TASK_ID]}
+
+# lots of epochs so it fully converges (fast since the embeddings are cached)
+python train.py \
+    --model $model \
+    --l1-coefficient $l1 \
+    --train-samples 100000 \
+    --val-samples 10000 \
+    --batch-size 4096 \
+    --num-epochs 200 \
+    --expansion-factor 32 \
+    --learning-rate 1e-3 \
+    --optimizer adamw \
+    --seed 0

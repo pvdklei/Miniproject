@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH --job-name=sae_setup
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=01:00:00
+#SBATCH --output=logs/%x_%j.out
+
+# makes the conda env, installs everything and runs a quick test to check it works.
+# put the hf token in ~/.hf_token first (need access to ILSVRC/imagenet-1k).
+set -e
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+source $(conda info --base)/etc/profile.d/conda.sh
+
+if ! conda env list | grep -q ieia; then
+    conda create -y -n ieia python=3.11
+fi
+conda activate ieia
+pip install torch torchvision transformers datasets matplotlib pillow numpy
+
+export HF_TOKEN=$(cat ~/.hf_token)
+export HF_HOME=/scratch-shared/$USER/hf
+mkdir -p $HF_HOME
+
+cd $HOME/miniproject
+python -c "import torch; print('cuda?', torch.cuda.is_available())"
+python train.py --test-run
