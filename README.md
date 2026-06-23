@@ -80,6 +80,8 @@ print(names[logits.argmax(-1).item()])
 
 ```
 
+One thing to watch out for: mobilenet has 1001 output classes, not 1000. Index 0 is an extra background class, so imagenet class `i` sits at index `i + 1`. So to compare a mobilenet prediction with an imagenet label you subtract one (`argmax - 1`). Efficientnet has the normal 1000 classes and needs no shift.
+
 ## Training a SAE
 
 To train an a sparse autoencoder on some models embeddings (second to last layer, `pooled_output` attribute) run something like. 
@@ -93,6 +95,25 @@ python train.py --test-run            # quick smoke test, writes nothing
 ```
 
 The model params and stats will be saved to `./output/<run>`, the embeddings produced by the model will be cached to `./embeddings`.
+
+### Trained runs
+
+We trained six autoencoders, three lambda values for each of the two models. All runs use the same config: AdamW, learning rate 1e-3, expansion factor 32 (so 40960 sparse features), 200 epochs, batch size 4096, 100000 train images, 10000 validation images, seed 0.
+
+These are the scores on the validation set.
+
+| model | lambda | recon error | L1 | active (L0) | acc with sae | acc without |
+| --- | --- | --- | --- | --- | --- | --- |
+| efficientnet | 4e-4 | 0.0088 | 50.6 | 1698 | 75.8% | 75.7% |
+| efficientnet | 8e-4 | 0.0149 | 41.9 | 1713 | 75.7% | 75.7% |
+| efficientnet | 1.6e-3 | 0.0385 | 28.2 | 1957 | 75.5% | 75.7% |
+| mobilenet | 4e-4 | 0.0128 | 49.1 | 1653 | 71.5% | 71.6% |
+| mobilenet | 8e-4 | 0.0154 | 42.7 | 1673 | 71.5% | 71.6% |
+| mobilenet | 1.6e-3 | 0.0391 | 29.5 | 1867 | 71.5% | 71.6% |
+
+`recon error` is the reconstruction error in the normalized space. `L1` is the sum of the feature sizes and `L0` is how many features are active (out of 40960), both measure sparsity. `acc with sae` is the imagenet top-1 accuracy when you push the reconstructed embedding through the classifier head, `acc without` is the same but with the original embedding. They are almost equal, so the autoencoder keeps the classification.
+
+The lowest lambda (4e-4) was best for both models: lower reconstruction error and fewer active features.
 
 ## Using a SAE
 

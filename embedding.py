@@ -85,6 +85,10 @@ class MobileNetV2(ImageNetClassifier):
     Params:    ~3.5M  (the smallest / fastest here)
     Embedding: 1280-dim
     Speed:     ~0.30 GFLOPs/image (100+ images per second)
+
+    Note: this model has 1001 output classes, not 1000. Index 0 is an extra
+    background class, so imagenet class i sits at logit index i + 1. To compare
+    with imagenet labels, subtract 1 from the predicted index (argmax - 1).
     """
 
     model_id = "google/mobilenet_v2_1.0_224"
