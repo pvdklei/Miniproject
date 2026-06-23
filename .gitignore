@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Generated artifacts (large, reproducible)
+output/
+embeddings/
+results/
+*.pt
+
+# SLURM logs
+logs/
+slurm_*.out
+
+# Local environments / secrets
+.venv/
+venv/
+env/
+.hf_token
+
+# Editor / OS
+.vscode/
+.DS_Store
+
+# AI agents / coding assistants
+.claude/
+.cursor/
+.windsurf/
+.continue/
+.codeium/
+.cody/
+.aider*
+.gemini/
+.codex/
+.opencode/
+.cline/
+.clinerules/
+.roo/
+.augment/
+.amazonq/
+.tabnine/
+.zed/
+.trae/
+.pearai/
+.github/copilot/
+
+# Notes
+idea.md
+
+# Job files for Snellius
+*.job
+*.sh
+
+# Pdfs
+*.pdf
