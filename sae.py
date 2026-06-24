@@ -57,6 +57,8 @@ class SparseAutoEncoder(nn.Module):
         self.W_dec = nn.Parameter(torch.empty(d_input, n_features))  # (d_input, n_features)
         self.b_dec = nn.Parameter(torch.zeros(d_input))  # (d_input,)
 
+        self.mean = torch.zeros(d_input)  # (d_input,) set after training or loading
+
         self._init_parameters()
 
     def _init_parameters(self) -> None:
@@ -75,6 +77,19 @@ class SparseAutoEncoder(nn.Module):
     def decode(self, features: torch.Tensor) -> torch.Tensor:
         """features: (batch, n_features) -> reconstruction: (batch, d_input)."""
         return F.linear(features, self.W_dec, self.b_dec)  # (batch, d_input)
+
+    def normalize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """raw embedding -> (mean-subtracted unit-norm embedding, the length removed).
+
+        The length is returned so unnormalize can put the embedding back later.
+        """
+        centered = x - self.mean  # (batch, d_input)
+        scale = centered.norm(dim=-1, keepdim=True)  # (batch, 1)
+        return centered / scale.clamp(min=1e-8), scale  # (batch, d_input), (batch, 1)
+
+    def unnormalize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """inverse of normalize: scale back up and add the mean."""
+        return x * scale + self.mean  # (batch, d_input)
 
     def forward(self, x: torch.Tensor) -> SAEOutput:
         features = self.encode(x)  # (batch, n_features)

@@ -1,0 +1,71 @@
+#!/bin/bash
+#SBATCH --job-name=sae_attribute
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=08:00:00
+#SBATCH --array=0-23
+#SBATCH --output=logs/%x_%A_%a.out
+
+# one array task per (run, kind, method). uses the trained sae.pt files and the
+# cached embeddings that are already in output/ and embeddings/. each task writes
+# into output/<run>/<kind>/<analysis-name>/, and a finished analysis is skipped.
+set -e
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate ieia
+
+export HF_TOKEN=$(cat ~/.hf_token)
+export HF_HOME=/scratch-shared/$USER/hf
+mkdir -p $HF_HOME
+
+cd $HOME/miniproject
+
+# the two best autoencoders, one per model
+eff=efficientnet_adamw_l10.0004_lr0.001_x32_e200_b4096_n100000_seed0
+mob=mobilenet_adamw_l10.0004_lr0.001_x32_e200_b4096_n100000_seed0
+
+# 24 configs. sparse_to_logits is cheap so it gets all methods; image_to_sparse
+# only gets the affordable ones (no shapley_sampling or kernel_shap on pixels,
+# those run the cnn inside every perturbation and would not finish in time).
+runs=()
+kinds=()
+methods=()
+add() { runs+=($1); kinds+=($2); methods+=($3); }
+
+for run in $eff $mob; do
+    for method in integrated_gradients saliency input_x_gradient lime kernel_shap shapley_sampling feature_ablation; do
+        add $run sparse_to_logits $method
+    done
+    for method in integrated_gradients saliency input_x_gradient lime feature_ablation; do
+        add $run image_to_sparse $method
+    done
+done
+
+run=${runs[$SLURM_ARRAY_TASK_ID]}
+kind=${kinds[$SLURM_ARRAY_TASK_ID]}
+method=${methods[$SLURM_ARRAY_TASK_ID]}
+echo "task $SLURM_ARRAY_TASK_ID: $run $kind $method"
+
+# image_to_sparse runs the cnn per perturbation, so it gets fewer images
+if [ "$kind" = "image_to_sparse" ]; then
+    num_images=200
+else
+    num_images=2000
+fi
+
+python attribute.py \
+    --run $run \
+    --kind $kind \
+    --method $method \
+    --split validation \
+    --num-images $num_images \
+    --top-k 5 \
+    --n-steps 32 \
+    --n-samples 200 \
+    --baseline random \
+    --baseline-trials 5 \
+    --seed 0

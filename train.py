@@ -23,7 +23,7 @@ Every training run is saved in output/<run-name>/ where the name encodes the con
 Rerunning an existing config stops immediately. Each run folder contains:
 
 config.json     the exact hyperparameters
-sae.pt          the trained SAE (state dict + dims + config + normalizer)
+sae.pt          the trained SAE (state dict + dims + config + mean)
 metrics.json    per-epoch training history and final validation metrics
 *.png           loss / sparsity plots
 
@@ -45,33 +45,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib
 matplotlib.use("Agg")  # no display on the cluster compute nodes
 import matplotlib.pyplot as plt
 
-from embedding import ImageNetClassifier, EfficientNetB0, MobileNetV2
-from dataset import ImageNetDataset
+from embedding import MODELS, ModelName, get_embeddings
+from dataset import Split
 from sae import SparseAutoEncoder
 
-ModelName = Literal["efficientnet", "mobilenet"]
 OptimizerName = Literal["adam", "adamw"]
-Split = Literal["train", "validation"]
 
 OUTPUT_DIR = Path("output")
-EMBED_CACHE_DIR = Path("embeddings")
-DATASET_ID = "ILSVRC/imagenet-1k"
-TRAIN_SPLIT: Split = "train"
-VAL_SPLIT: Split = "validation"
 PLOT_DPI = 120
 WARMUP_STEPS = 500  # paper: linearly warm up the LR from 0 over this many steps
-EMBED_BATCH_SIZE = 256  # how many images go through the CNN at once (keep small)
-
-MODELS: dict[ModelName, type[ImageNetClassifier]] = {
-    "efficientnet": EfficientNetB0,
-    "mobilenet": MobileNetV2,
-}
+TRAIN_SPLIT: Split = "train"
+VAL_SPLIT: Split = "validation"
 
 # Overrides applied by --test-run.
 TEST_RUN: dict[str, int] = dict(
@@ -133,71 +122,12 @@ class Metrics:
 
 
 @dataclass
-class Normalizer:
-    """Paper preprocessing: subtract the mean activation vector, then scale each
-    embedding to unit norm. Fitted on the train split and reused everywhere."""
-
-    mean: torch.Tensor  # (d_input,)
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:  # x: (batch, d_input)
-        return F.normalize(x - self.mean, dim=-1)  # (batch, d_input)
-
-
-@dataclass
 class SAECheckpoint:
     config: Config
     d_input: int
     n_features: int
-    normalizer: Normalizer
+    mean: torch.Tensor
     state_dict: dict[str, torch.Tensor]
-
-
-# EMBEDDINGS
-
-@dataclass
-class EmbeddingData:
-    """The embeddings of a split, together with each image's class label."""
-
-    embeddings: torch.Tensor  # (n, d_input)
-    labels: torch.Tensor  # (n,) imagenet class index 0-999
-
-
-@torch.no_grad()
-def get_embeddings(
-    model: ImageNetClassifier,
-    model_name: ModelName,
-    split: Split,
-    n_samples: int,
-    use_cache: bool,
-) -> EmbeddingData:
-    """Embed the first n_samples images and keep their labels.
-
-    Images go through the CNN in small batches (EMBED_BATCH_SIZE) so they fit in
-    GPU memory. The result is cached so the CNN only runs once per (model, split, n).
-    """
-    cache = EMBED_CACHE_DIR / f"{model_name}_{split}_n{n_samples}.pt"
-    if use_cache and cache.exists():
-        saved = torch.load(cache)
-        return EmbeddingData(saved["embeddings"], saved["labels"])
-
-    images: list = []
-    labels: list[int] = []
-    chunks: list[torch.Tensor] = []
-    for image, label in ImageNetDataset(split, DATASET_ID, n_samples):
-        images.append(image)
-        labels.append(label)
-        if len(images) == EMBED_BATCH_SIZE:
-            chunks.append(model.forward_to_embedding(images).cpu())  # (batch, d_input)
-            images = []
-    if images:
-        chunks.append(model.forward_to_embedding(images).cpu())  # (rest, d_input)
-    embeddings = torch.cat(chunks)  # (n_samples, d_input)
-    label_tensor = torch.tensor(labels)  # (n_samples,)
-
-    if use_cache:
-        EMBED_CACHE_DIR.mkdir(exist_ok=True)
-        torch.save({"embeddings": embeddings, "labels": label_tensor}, cache)
-    return EmbeddingData(embeddings, label_tensor)
 
 
 # EVALUATION
@@ -205,7 +135,6 @@ def get_embeddings(
 @torch.no_grad()
 def evaluate(
     sae: SparseAutoEncoder,
-    normalizer: Normalizer,
     embeddings: torch.Tensor,
     l1_coefficient: float,
     batch_size: int,
@@ -215,7 +144,7 @@ def evaluate(
     n = 0
     recon = sparsity = total = l0 = 0.0
     for (emb,) in DataLoader(TensorDataset(embeddings), batch_size=batch_size):
-        x = normalizer(emb.to(device))  # (batch, d_input)
+        x, _ = sae.normalize(emb.to(device))  # (batch, d_input)
         out = sae(x)  # features (batch, n_features)
         loss = SparseAutoEncoder.loss(out, l1_coefficient)  # scalars
         batch = out.features.shape[0]  # int (this batch's size)
@@ -239,12 +168,12 @@ def train(
     d_input = train_emb.shape[1]  # int
     n_features = config.expansion_factor * d_input
 
-    # Paper preprocessing: the normalizer's mean is the train mean activation vector.
-    normalizer = Normalizer(mean=train_emb.mean(dim=0).to(device))  # mean: (d_input,)
-
     sae = SparseAutoEncoder(d_input, n_features).to(device)
+    # Paper preprocessing: the normalization mean is the train mean embedding.
+    sae.mean = train_emb.mean(dim=0).to(device)  # (d_input,)
     # Paper init: b_dec is the mean of the normalized train embeddings.
-    sae.b_dec.data = normalizer(train_emb.to(device)).mean(dim=0)  # (d_input,)
+    normalized, _ = sae.normalize(train_emb.to(device))  # (n, d_input)
+    sae.b_dec.data = normalized.mean(dim=0)  # (d_input,)
 
     optimizers: dict[OptimizerName, Callable[..., torch.optim.Optimizer]] = {
         "adam": torch.optim.Adam,
@@ -272,7 +201,7 @@ def train(
         totals = torch.zeros(3)  # (3,) running total, recon, sparsity
         steps = 0
         for (emb,) in train_loader:
-            x = normalizer(emb.to(device))  # (batch, d_input)
+            x, _ = sae.normalize(emb.to(device))  # (batch, d_input)
             loss = SparseAutoEncoder.loss(sae(x), config.l1_coefficient)  # scalars
 
             optimizer.zero_grad()
@@ -288,9 +217,7 @@ def train(
             steps += 1
 
         sae.eval()
-        val = evaluate(
-            sae, normalizer, val_emb, config.l1_coefficient, config.batch_size, device
-        )
+        val = evaluate(sae, val_emb, config.l1_coefficient, config.batch_size, device)
         ep_total, ep_recon, ep_sparsity = (totals / steps).tolist()  # 3 floats
         history.train_total.append(ep_total)
         history.train_recon.append(ep_recon)
@@ -303,10 +230,8 @@ def train(
             f"val recon {val.recon:.4f}  val L0 {val.l0:.1f}"
         )
 
-    final = evaluate(
-        sae, normalizer, val_emb, config.l1_coefficient, config.batch_size, device
-    )
-    checkpoint = SAECheckpoint(config, d_input, n_features, normalizer, sae.state_dict())
+    final = evaluate(sae, val_emb, config.l1_coefficient, config.batch_size, device)
+    checkpoint = SAECheckpoint(config, d_input, n_features, sae.mean, sae.state_dict())
     return checkpoint, Metrics(history, final)
 
 
@@ -318,14 +243,14 @@ def save_run(run_dir: Path, checkpoint: SAECheckpoint, metrics: Metrics) -> None
     (run_dir / "config.json").write_text(json.dumps(asdict(checkpoint.config), indent=2))
     (run_dir / "metrics.json").write_text(json.dumps(asdict(metrics), indent=2))
     # Save a plain dict (tensors + primitives) so the SAE can be reloaded without
-    # importing this module: torch.load(...), then SparseAutoEncoder(d_input,
-    # n_features).load_state_dict(state_dict) and Normalizer(normalizer_mean).
+    # importing this module: build SparseAutoEncoder(d_input, n_features),
+    # load_state_dict(state_dict), then set sae.mean = normalizer_mean.
     torch.save(
         {
             "config": asdict(checkpoint.config),
             "d_input": checkpoint.d_input,
             "n_features": checkpoint.n_features,
-            "normalizer_mean": checkpoint.normalizer.mean.cpu(),
+            "normalizer_mean": checkpoint.mean.cpu(),
             "state_dict": {k: v.cpu() for k, v in checkpoint.state_dict.items()},
         },
         run_dir / "sae.pt",

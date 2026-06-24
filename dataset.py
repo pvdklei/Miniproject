@@ -18,6 +18,7 @@ import PIL.Image
 from datasets import load_dataset
 
 Split = Literal["train", "validation"]
+DATASET_ID = "ILSVRC/imagenet-1k"
 
 
 class ImageNetDataset(IterableDataset):
@@ -26,7 +27,7 @@ class ImageNetDataset(IterableDataset):
     def __init__(
         self,
         split: Split = "train",
-        dataset_id: str = "ILSVRC/imagenet-1k",
+        dataset_id: str = DATASET_ID,
         max_samples: int | None = None,
     ):
         self.split = split
