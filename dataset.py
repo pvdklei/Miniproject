@@ -2,7 +2,7 @@
 
 Dataset for training the sparse autoencoder.
 
-ImageNet-1k on hugging face is gated: run `huggingface-cli login` and accept the
+ImageNet-1k on hugging face is private: run `huggingface-cli login` and accept the
 dataset terms first.
 
 The full train split is ~150GB, so we stream it and only ever hold one batch of

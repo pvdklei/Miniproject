@@ -99,7 +99,7 @@ GALLERY_SIZE = 16
 
 # overrides applied by --test-run
 TEST_RUN: dict[str, int] = dict(
-    num_images=2, top_k=2, n_steps=4, baseline_trials=2, n_samples=8
+    num_images=2, top_k=2, n_steps=4, baseline_trials=2, n_samples=8, activator_images=2
 )
 
 
@@ -117,6 +117,9 @@ class AttributeConfig:
     baseline_trials: int  # image_to_sparse: random baselines to average over
     n_steps: int  # integrated gradients steps
     n_samples: int  # perturbation samples for lime, kernel_shap and shapley_sampling
+    activator_images: int  # image_to_sparse: images scanned for the activator galleries
+    min_dim: int  # activations: lowest sparse dimension to build a gallery for
+    max_dim: int  # activations: one past the highest sparse dimension to build a gallery for
     save_pt: bool  # also save the raw attribution tensors next to the png heatmaps
     seed: int  # random seed
 
@@ -131,6 +134,11 @@ class AttributeConfig:
             base = "white" if self.baseline == "white" else f"random{self.baseline_trials}"
             return f"{common}_k{self.top_k}_{base}"
         return common
+
+    @property
+    def activators_name(self) -> str:
+        """Folder for the activator galleries (shared by every method, names the size)."""
+        return f"activators_{self.split}_n{self.activator_images}"
 
 
 # LOADING
@@ -363,67 +371,91 @@ def save_top_dims(
 
 
 def save_gallery(path: Path, images: list[PIL.Image.Image], titles: list[str]) -> None:
-    """Save a grid of the images that activate a dimension, strongest first."""
+    """Save a small grid of the images that activate a dimension, strongest first."""
     path.parent.mkdir(parents=True, exist_ok=True)
     cols = min(4, len(images))
     rows = (len(images) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(2 * cols, 2 * rows), squeeze=False)
     for ax in axes.flat:
         ax.axis("off")
     for ax, image, title in zip(axes.flat, images, titles):
         ax.imshow(image)
-        ax.set_title(title, fontsize=7)
+        ax.set_title(title, fontsize=6)
     fig.tight_layout()
-    fig.savefig(path, dpi=100)
+    fig.savefig(path, dpi=70)  # small files: there can be thousands of these
     plt.close(fig)
 
 
 # THE TWO ANALYSES
 
-@dataclass
-class Activator:
-    """An image that activated a sparse dimension, kept for the gallery."""
-
-    activation: float
-    image_index: int
-    label: int
-    image: PIL.Image.Image
+# one activator: which image fired a dimension, and how strongly
+Activator = tuple[float, int]  # (activation, image_index)
 
 
 def write_activators(
     model: ImageNetClassifier, sae: SparseAutoEncoder, data: EmbeddingData,
-    split: Split, device: Device, out_dir: Path,
+    split: Split, device: Device, out_dir: Path, min_dim: int, max_dim: int,
 ) -> None:
-    """Record, for each sparse dimension, all the images that activate it.
+    """Record, for each sparse dimension in [min_dim, max_dim), the images that
+    activate it. This only needs the sparse code, so it is shared by every method.
+    Each dimension gets an activators.json (all its activators, strongest first)
+    and a gallery image of the strongest ones.
 
-    This only depends on the sparse code, not on the attribution method, so it is
-    written once per run and shared by every method's analysis. Each dimension
-    gets an activators.json (all its activators, strongest first) and a gallery.
+    Only the dimensions in the range get galleries, and only the images that show up
+    in some gallery are streamed and kept, so a small range stays cheap even over
+    many images (the activations themselves are one batched encode call).
     """
     emb = data.embeddings.to(device)
     with torch.no_grad():
         normalized, _ = sae.normalize(emb)
         sparse = sae.encode(normalized)  # (N, n_features)
 
+    # collect every (image, dim) activation in the range in one pass, then group
+    hi = min(max_dim, sae.n_features)
+    window = sparse[:, min_dim:hi]  # (N, range)
+    rows, cols = (window > 0).nonzero(as_tuple=True)  # active (image, dim) pairs
+    values = window[rows, cols]
     activators: dict[int, list[Activator]] = {}
-    images = ImageNetDataset(split, max_samples=emb.shape[0])
-    for i, (image, _label) in enumerate(images):
-        label = int(data.labels[i])
-        resized = image.resize((224, 224))
-        for d in (sparse[i] > 0).nonzero().flatten().tolist():
-            activators.setdefault(d, []).append(Activator(float(sparse[i, d]), i, label, resized))
+    for img_i, dim_j, act in zip(rows.tolist(), cols.tolist(), values.tolist()):
+        activators.setdefault(min_dim + dim_j, []).append((act, img_i))
+    for found in activators.values():
+        found.sort(reverse=True)  # strongest activation first
 
+    # only the images shown in a gallery need to be streamed and kept
+    needed = {img for found in activators.values() for _, img in found[:GALLERY_SIZE]}
+    thumbnails: dict[int, PIL.Image.Image] = {}
+    for i, (image, _label) in enumerate(ImageNetDataset(split, max_samples=emb.shape[0])):
+        if i in needed:
+            thumbnails[i] = image.resize((160, 160))
+
+    labels = data.labels.tolist()
     for d, found in activators.items():
-        found.sort(key=lambda a: a.activation, reverse=True)
         dim_dir = out_dir / "dimensions" / str(d)
         dim_dir.mkdir(parents=True, exist_ok=True)
         (dim_dir / "activators.json").write_text(json.dumps(
-            [{"image_index": a.image_index, "label": a.label,
-              "label_name": class_name(model, a.label), "activation": a.activation}
-             for a in found], indent=2))
+            [{"image_index": img, "label": labels[img],
+              "label_name": class_name(model, labels[img]), "activation": act}
+             for act, img in found], indent=2))
         shown = found[:GALLERY_SIZE]
-        save_gallery(dim_dir / "activators.png", [a.image for a in shown],
-                     [f"img{a.image_index} {a.activation:.2f}" for a in shown])
+        save_gallery(dim_dir / "activators.png", [thumbnails[img] for _, img in shown],
+                     [f"img{img} {act:.2f}" for act, img in shown])
+
+    # a small summary, useful for RQ2: how many dimensions fire on how many images
+    counts = sorted(len(v) for v in activators.values())
+    stats = {
+        "n_images": emb.shape[0],
+        "n_features": sae.n_features,
+        "min_dim": min_dim,
+        "max_dim": hi,
+        "n_dims_activated": len(counts),
+        "frac_dims_activated": len(counts) / (hi - min_dim) if hi > min_dim else 0,
+        "activators_per_dim_mean": sum(counts) / len(counts) if counts else 0,
+        "activators_per_dim_median": counts[len(counts) // 2] if counts else 0,
+        "activators_per_dim_max": counts[-1] if counts else 0,
+        "n_dims_single_activator": counts.count(1),
+        "frac_dims_single_activator": counts.count(1) / len(counts) if counts else 0,
+    }
+    (out_dir / "stats.json").write_text(json.dumps(stats, indent=2))
 
 
 def attribute_image_to_sparse(
@@ -544,10 +576,46 @@ def attribute_sparse_to_logits(
 
 # MAIN
 
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_activators(config: AttributeConfig, device: Device) -> None:
+    """Build only the activator galleries for image_to_sparse, then stop.
+
+    This is the --activations mode. The galleries depend only on the sparse code,
+    not on any attribution method, and cover --activator-images images. They live
+    in their own activators_<split>_n<N> folder and are skipped if already there.
+    """
+    if config.kind != "image_to_sparse":
+        raise SystemExit("--activations only applies to --kind image_to_sparse")
+    run_dir = OUTPUT_DIR / config.run
+    if not (run_dir / "sae.pt").exists():
+        raise SystemExit(f"no sae.pt found in {run_dir}")
+
+    activators_dir = run_dir / "image_to_sparse" / config.activators_name
+    if activators_dir.exists():
+        print(f"activators already done, see {activators_dir}")
+        return
+
+    seed_everything(config.seed)
+    sae, model_name = load_sae(run_dir, device)
+    model = MODELS[model_name](device=device)
+    data = load_cached(model, model_name, config.split, config.activator_images)
+    print(f"building activator galleries over {data.embeddings.shape[0]} images, "
+          f"dimensions {config.min_dim} to {config.max_dim}")
+    write_activators(model, sae, data, config.split, device, activators_dir,
+                     config.min_dim, config.max_dim)
+    print(f"saved -> {activators_dir}")
+
+
 def main(config: AttributeConfig, device: Device, test_run: bool) -> None:
-    """Load the trained autoencoder and its model, reuse the cached embeddings, run
-    the chosen analysis and save it. If the same analysis was already done, just say
-    where it is and stop."""
+    """Run one attribution analysis and save it. If the same analysis was already
+    done, just say where it is and stop. This never builds activator galleries; use
+    --activations for those."""
     print(f"device: {device}  run: {config.run}  kind: {config.kind}"
           f"{'  [TEST RUN]' if test_run else ''}")
 
@@ -560,23 +628,13 @@ def main(config: AttributeConfig, device: Device, test_run: bool) -> None:
         print(f"analysis already done, see {analysis_dir}")
         return
 
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    torch.cuda.manual_seed_all(config.seed)
-
+    seed_everything(config.seed)
     sae, model_name = load_sae(run_dir, device)
     model = MODELS[model_name](device=device)
     data = load_cached(model, model_name, config.split, config.num_images)
     print(f"analyzing {data.embeddings.shape[0]} images from {model_name} {config.split}")
 
     if config.kind == "image_to_sparse":
-        # the activator galleries depend only on the sparse code, not the method, so
-        # write them once into a shared folder that every method's analysis reuses
-        # (the first run fills it; later runs with more images do not rebuild it)
-        activators_dir = run_dir / "image_to_sparse" / "activators"
-        if not test_run and not activators_dir.exists():
-            write_activators(model, sae, data, config.split, device, activators_dir)
         attribute_image_to_sparse(config, model, sae, data, analysis_dir, device, test_run)
     elif config.kind == "sparse_to_logits":
         attribute_sparse_to_logits(config, model, sae, data, analysis_dir, device, test_run)
@@ -613,6 +671,15 @@ def parse_args() -> argparse.Namespace:
                    help="integrated gradients steps")
     p.add_argument("--n-samples", type=int, default=200,
                    help="perturbation samples for lime, kernel_shap and shapley_sampling")
+    p.add_argument("--activations", action="store_true",
+                   help="image_to_sparse: only build the activator galleries, no attribution")
+    p.add_argument("--activator-images", type=int, default=200,
+                   help="how many images the --activations galleries scan (cheap, no "
+                        "attribution, so it can be much larger than --num-images)")
+    p.add_argument("--min-dim", type=int, default=0,
+                   help="activations: lowest sparse dimension to build a gallery for")
+    p.add_argument("--max-dim", type=int, default=10**9,
+                   help="activations: stop before this sparse dimension (default: all)")
     p.add_argument("--seed", type=int, default=0, help="random seed")
     p.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto",
                    help="where to run (auto picks cuda, then mps, then cpu)")
@@ -640,8 +707,12 @@ if __name__ == "__main__":
         run=args.run, kind=cast(Kind, args.kind), method=cast(Method, args.method),
         split=cast(Split, args.split), num_images=args.num_images, top_k=args.top_k,
         baseline=cast(ImageBaseline, args.baseline), baseline_trials=args.baseline_trials,
-        n_steps=args.n_steps, n_samples=args.n_samples, save_pt=not args.no_pt, seed=args.seed,
+        n_steps=args.n_steps, n_samples=args.n_samples, activator_images=args.activator_images,
+        min_dim=args.min_dim, max_dim=args.max_dim, save_pt=not args.no_pt, seed=args.seed,
     )
     if args.test_run:
         config = replace(config, **TEST_RUN)
-    main(config, pick_device(args.device), args.test_run)
+    if args.activations:
+        build_activators(config, pick_device(args.device))
+    else:
+        main(config, pick_device(args.device), args.test_run)
